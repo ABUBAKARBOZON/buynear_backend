@@ -15,7 +15,7 @@ const PORT = process.env.PORT || 3000;
 
 const allowedOrigins = [
   'http://localhost:3000',
-  'https://buynear-frontend.vercel.app',
+  'https://buynear.vercel.app',
   'https://buynear.store',
   'https://www.buynear.store'
 ];
