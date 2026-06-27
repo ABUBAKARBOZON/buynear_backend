@@ -4,6 +4,17 @@ import { requireAuth } from '../middleware/auth.js';
 
 const router = Router();
 
+/* ── Slug helpers (mirrors auth.js logic) ─────────────────────────────── */
+function cleanPart(s) {
+  return s.toLowerCase().trim()
+    .replace(/[^a-z0-9\s-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/, '');
+}
+function makeBaseSlug(shopName)            { return cleanPart(shopName); }
+function makeLocationSlug(shopName, loc)   { return [cleanPart(shopName), cleanPart(loc)].filter(Boolean).join('-'); }
+
 function formatSeller(row) {
   return {
     id: row.id,
@@ -146,33 +157,94 @@ router.get('/:slug', async (req, res) => {
   }
 });
 
-// ─── PUT /api/profile ──────────────────────────────────────────────────────
+// ─── PUT /api/sellers/profile/me ──────────────────────────────────────────
+// When shopName changes we regenerate the slug (same priority: name → name-location).
+// Returns { slugChanged: true, newSlug } in the response so the frontend can update the stored user.
 router.put('/profile/me', requireAuth, async (req, res) => {
   try {
     const { shopName, fullName, bio, country, location, address, phone, instagram, facebook, avatar, cover } = req.body;
 
+    // Fetch current seller so we can compare shop name + get location fallback
+    const { data: current } = await supabase
+      .from('sellers').select('shop_name, slug, location').eq('id', req.user.id).single();
+
     const updates = {};
-    if (shopName !== undefined) updates.shop_name = shopName;
-    if (fullName !== undefined) updates.full_name = fullName;
-    if (bio !== undefined) updates.bio = bio;
-    if (location !== undefined) updates.location = location;
-    if (address !== undefined) updates.address = address;
-    if (phone !== undefined) updates.phone = phone;
-    if (instagram !== undefined) updates.instagram = instagram;
-    if (facebook !== undefined) updates.facebook = facebook;
-    if (avatar !== undefined) updates.avatar = avatar;
-    if (cover !== undefined) updates.cover = cover;
+    if (fullName  !== undefined) updates.full_name  = fullName;
+    if (bio       !== undefined) updates.bio        = bio;
+    if (location  !== undefined) updates.location   = location;
+    if (address   !== undefined) updates.address    = address;
+    if (phone     !== undefined) updates.phone      = phone;
+    if (instagram !== undefined) updates.instagram  = instagram;
+    if (facebook  !== undefined) updates.facebook   = facebook;
+    if (avatar    !== undefined) updates.avatar     = avatar;
+    if (cover     !== undefined) updates.cover      = cover;
+
+    let slugChanged = false;
+    let newSlug     = current?.slug;
+
+    // Regenerate slug only when shop name actually changed
+    if (shopName !== undefined) {
+      updates.shop_name = shopName;
+
+      const nameChanged = shopName.trim().toLowerCase() !== (current?.shop_name || '').trim().toLowerCase();
+      if (nameChanged) {
+        const loc      = location ?? current?.location ?? '';
+        const base     = makeBaseSlug(shopName);
+        const withLoc  = makeLocationSlug(shopName, loc);
+
+        // Check base slug — exclude the current seller so they can "re-claim" their own
+        const { data: baseRow } = await supabase
+          .from('sellers').select('id').eq('slug', base).neq('id', req.user.id).single();
+
+        if (!baseRow) {
+          newSlug = base;
+        } else {
+          const { data: locRow } = await supabase
+            .from('sellers').select('id').eq('slug', withLoc).neq('id', req.user.id).single();
+
+          if (!locRow) {
+            newSlug = withLoc;
+          } else {
+            return res.status(409).json({
+              slugConflict: true,
+              error: `The shop name "${shopName}" is already taken${withLoc !== base ? ` in ${loc}` : ''}. Please choose a different shop name.`,
+            });
+          }
+        }
+
+        updates.slug = newSlug;
+        slugChanged  = newSlug !== current?.slug;
+      }
+    }
 
     const { data: row, error } = await supabase
-      .from('sellers')
-      .update(updates)
-      .eq('id', req.user.id)
-      .select()
-      .single();
+      .from('sellers').update(updates).eq('id', req.user.id).select().single();
 
     if (error) return res.status(500).json({ error: 'Failed to update profile' });
 
-    res.json(formatSeller(row));
+    res.json({ ...formatSeller(row), slugChanged, newSlug });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ─── POST /api/sellers/check-slug ────────────────────────────────────────
+// Used by Signup page to show a live preview of the slug before submitting.
+router.post('/check-slug', async (req, res) => {
+  try {
+    const { shopName, location } = req.body;
+    if (!shopName) return res.status(400).json({ error: 'shopName required' });
+
+    const base     = makeBaseSlug(shopName);
+    const withLoc  = makeLocationSlug(shopName, location || '');
+
+    const { data: baseRow } = await supabase.from('sellers').select('id').eq('slug', base).single();
+    if (!baseRow) return res.json({ slug: base, conflict: false });
+
+    const { data: locRow } = await supabase.from('sellers').select('id').eq('slug', withLoc).single();
+    if (!locRow) return res.json({ slug: withLoc, conflict: 'name', fallback: true });
+
+    return res.json({ slug: withLoc, conflict: 'both' });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }

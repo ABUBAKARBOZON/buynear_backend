@@ -11,21 +11,26 @@ const router = Router();
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 
 /**
- * Slug: shopname-country-location
- * e.g. "Kings Electronics", Nigeria, Lagos → kings-electronics-nigeria-lagos
- * Same combo gets a counter: kings-electronics-nigeria-lagos-2
+ * Slug strategy — shortest possible, cleanest URLs:
+ *   1st choice  → shop-name               e.g. buynear.store/kings-electronics
+ *   2nd choice  → shop-name-location      e.g. buynear.store/kings-electronics-lagos
+ *
+ * If both are taken the signup is rejected telling the seller to change their shop name.
  */
 function cleanPart(s) {
   return s.toLowerCase().trim()
     .replace(/[^a-z0-9\s-]/g, '')
     .replace(/\s+/g, '-')
-    .replace(/-+/g, '-');
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/, '');
 }
 
-function makeSlug(shopName, country = '', location = '') {
-  const parts = [cleanPart(shopName), cleanPart(country), cleanPart(location)]
-    .filter(Boolean);
-  return parts.join('-');
+function makeBaseSlug(shopName) {
+  return cleanPart(shopName);
+}
+
+function makeLocationSlug(shopName, location) {
+  return [cleanPart(shopName), cleanPart(location)].filter(Boolean).join('-');
 }
 
 function signToken(user) {
@@ -100,18 +105,33 @@ router.post('/signup', async (req, res) => {
       return res.status(409).json({ error: 'Email already in use' });
     }
 
-    const baseSlug = makeSlug(shopName, country, location);
+    // Try slug = shopName only first (cleanest URL)
+    const baseSlug     = makeBaseSlug(shopName);
+    const locationSlug = makeLocationSlug(shopName, location);
 
-    const { data: slugExists } = await supabase
-      .from('sellers')
-      .select('id')
-      .eq('slug', baseSlug)
-      .single();
+    const { data: baseExists } = await supabase
+      .from('sellers').select('id').eq('slug', baseSlug).single();
 
-    if (slugExists) {
-      return res.status(409).json({
-        error: `A shop with that name already exists in ${location}, ${country}. Please change your shop name or use a more specific location (e.g. "Lagos Island" instead of "Lagos").`,
-      });
+    let finalSlug;
+
+    if (!baseExists) {
+      // Best case — buynear.store/kings-electronics
+      finalSlug = baseSlug;
+    } else {
+      // Base taken — try buynear.store/kings-electronics-lagos
+      const { data: locationExists } = await supabase
+        .from('sellers').select('id').eq('slug', locationSlug).single();
+
+      if (!locationExists) {
+        finalSlug = locationSlug;
+      } else {
+        // Both taken — ask the seller to pick a different shop name
+        return res.status(409).json({
+          slugConflict: true,
+          suggestedSlug: locationSlug,
+          error: `The shop name "${shopName}" is already taken${locationSlug !== baseSlug ? ` in ${location}` : ''}. Please choose a different shop name.`,
+        });
+      }
     }
 
     const password_hash = await bcrypt.hash(password, 10);
@@ -120,7 +140,7 @@ router.post('/signup', async (req, res) => {
       .from('sellers')
       .insert({
         shop_name:      shopName,
-        slug:           baseSlug,
+        slug:           finalSlug,
         full_name:      fullName,
         email:          email.toLowerCase(),
         password_hash,
