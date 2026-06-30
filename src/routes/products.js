@@ -8,6 +8,16 @@ const router = Router();
 const PRODUCT_LIMIT_PER_SELLER = 50;
 const DEFAULT_PAGE_SIZE = 12;
 
+/** Haversine formula — distance between two coordinates in kilometres */
+function haversineKm(lat1, lng1, lat2, lng2) {
+  const R  = 6371;
+  const dL = toRad(lat2 - lat1);
+  const dG = toRad(lng2 - lng1);
+  const a  = Math.sin(dL / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dG / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+function toRad(deg) { return (deg * Math.PI) / 180; }
+
 async function refreshProductStatuses() {
   try {
     await supabase.rpc('update_product_status');
@@ -56,6 +66,8 @@ function formatProduct(row, seller) {
     sellerSlug:     seller?.slug      || '',
     sellerVerified: seller?.verified  || false,
     sellerPhone:    seller?.phone      || '',
+    sellerLat:      seller?.lat ?? null,
+    sellerLng:      seller?.lng ?? null,
     country:        row.country       || seller?.country   || '',
     location:       row.location      || seller?.location  || '',
     createdAt:      row.created_at?.split('T')[0] || '',
@@ -78,9 +90,14 @@ router.get('/', async (req, res) => {
     const from  = (page - 1) * limit;
     const to    = from + limit - 1;
 
+    const lat = parseFloat(req.query.lat);
+    const lng = parseFloat(req.query.lng);
+    const hasCoords = !isNaN(lat) && !isNaN(lng);
+    const isNearOrDiscover = sort === 'near' || sort === 'discover';
+
     let query = supabase
       .from('products')
-      .select(`*, sellers!inner(id, shop_name, avatar, slug, verified, location, country, phone)`, { count: 'exact' });
+      .select(`*, sellers!inner(id, shop_name, avatar, slug, verified, location, country, phone, lat, lng)`, { count: 'exact' });
 
     if (sellerId) {
       query = query.eq('seller_id', sellerId);
@@ -96,6 +113,9 @@ router.get('/', async (req, res) => {
     else if (sort === 'price-high') query = query.order('price',   { ascending: false });
     else if (sort === 'popular')    query = query.order('views',   { ascending: false });
     else                            query = query.order('created_at', { ascending: false });
+    // 'near' and 'discover' both fall through to created_at ordering above —
+    // we re-sort in JS below once distance is attached, since Postgres can't
+    // do haversine sorting without PostGIS.
 
     query = query.range(from, to);
 
@@ -118,6 +138,34 @@ router.get('/', async (req, res) => {
       );
     }
 
+    // ── Near You / Discover sorting ───────────────────────────────────────
+    if (hasCoords && isNearOrDiscover) {
+      products = products.map((p) => {
+        const dist = (p.sellerLat != null && p.sellerLng != null)
+          ? haversineKm(lat, lng, p.sellerLat, p.sellerLng)
+          : Infinity;
+        return { ...p, distanceKm: dist };
+      });
+
+      if (sort === 'near') {
+        products.sort((a, b) => a.distanceKm - b.distanceKm);
+      } else {
+        // 'discover' — blend distance rank with recency rank (60/40 weight)
+        const n = products.length || 1;
+        const byDist = [...products].sort((a, b) => a.distanceKm - b.distanceKm);
+        const distRankOf = new Map(byDist.map((p, i) => [p.id, i]));
+        // products is already in created_at desc order from the query,
+        // so its current index IS the recency rank
+        const recencyRankOf = new Map(products.map((p, i) => [p.id, i]));
+
+        products.sort((a, b) => {
+          const scoreA = 0.6 * (distRankOf.get(a.id) / n) + 0.4 * (recencyRankOf.get(a.id) / n);
+          const scoreB = 0.6 * (distRankOf.get(b.id) / n) + 0.4 * (recencyRankOf.get(b.id) / n);
+          return scoreA - scoreB;
+        });
+      }
+    }
+
     res.json({
       products,
       pagination: { page, limit, total: count || 0, hasMore: (count || 0) > page * limit },
@@ -128,12 +176,40 @@ router.get('/', async (req, res) => {
   }
 });
 
+// ─── GET /api/products/by-code/:code ───────────────────────────────────────
+// Must be declared BEFORE GET /:id — otherwise Express matches "by-code"
+// itself as an :id value and this route never gets hit.
+router.get('/by-code/:code', async (req, res) => {
+  try {
+    const { data: rows, error } = await supabase
+      .from('products')
+      .select(`*, sellers!inner(id, shop_name, avatar, slug, verified, location, country, phone, lat, lng)`)
+      .eq('product_code', req.params.code.toUpperCase())
+      .limit(1);
+
+    if (error || !rows?.length) return res.status(404).json({ error: 'Product not found' });
+
+    const row = rows[0];
+    const newViews = (row.views || 0) + 1;
+
+    const { error: viewsErr } = await supabase
+      .from('products')
+      .update({ views: newViews })
+      .eq('id', row.id);
+    if (viewsErr) console.error('❌ views update error (by-code):', viewsErr.message);
+
+    res.json(formatProduct({ ...row, views: newViews }, row.sellers));
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // ─── GET /api/products/:id ─────────────────────────────────────────────────
 router.get('/:id', async (req, res) => {
   try {
     const { data: row, error } = await supabase
       .from('products')
-      .select(`*, sellers!inner(id, shop_name, avatar, slug, verified, location, country, phone)`)
+      .select(`*, sellers!inner(id, shop_name, avatar, slug, verified, location, country, phone, lat, lng)`)
       .eq('id', req.params.id)
       .single();
 
@@ -189,7 +265,6 @@ router.get('/:id', async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
-
 // ─── POST /api/products ────────────────────────────────────────────────────
 router.post('/', requireAuth, async (req, res) => {
   try {
@@ -295,7 +370,7 @@ router.put('/:id', requireAuth, async (req, res) => {
       .from('products')
       .update(updates)
       .eq('id', req.params.id)
-      .select(`*, sellers!inner(id, shop_name, avatar, slug, verified, location, country, phone)`)
+      .select(`*, sellers!inner(id, shop_name, avatar, slug, verified, location, country, phone, lat, lng)`)
       .single();
 
     if (error) return res.status(500).json({ error: 'Failed to update product' });
@@ -348,7 +423,7 @@ router.post('/:id/renew', requireAuth, async (req, res) => {
       .from('products')
       .update({ expires_at: newExpiry, status: 'active' })
       .eq('id', req.params.id)
-      .select(`*, sellers!inner(id, shop_name, avatar, slug, verified, location, country, phone)`)
+      .select(`*, sellers!inner(id, shop_name, avatar, slug, verified, location, country, phone, lat, lng)`)
       .single();
 
     if (error) return res.status(500).json({ error: 'Failed to renew product' });

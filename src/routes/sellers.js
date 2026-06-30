@@ -30,6 +30,8 @@ function formatSeller(row) {
     address: row.address || '',
     phone: row.phone || '',
     bio: row.bio || '',
+    lat: row.lat ?? null,
+    lng: row.lng ?? null,
     products: row.product_count || 0,
     rating: Number(row.rating) || 0,
     joinedAt: row.joined_at?.split('T')[0] || '',
@@ -162,7 +164,7 @@ router.get('/:slug', async (req, res) => {
 // Returns { slugChanged: true, newSlug } in the response so the frontend can update the stored user.
 router.put('/profile/me', requireAuth, async (req, res) => {
   try {
-    const { shopName, fullName, bio, country, location, address, phone, instagram, facebook, avatar, cover } = req.body;
+    const { shopName, fullName, bio, country, location, address, phone, instagram, facebook, avatar, cover, lat, lng } = req.body;
 
     // Fetch current seller so we can compare shop name + get location fallback
     const { data: current } = await supabase
@@ -178,6 +180,8 @@ router.put('/profile/me', requireAuth, async (req, res) => {
     if (facebook  !== undefined) updates.facebook   = facebook;
     if (avatar    !== undefined) updates.avatar     = avatar;
     if (cover     !== undefined) updates.cover      = cover;
+    if (lat       !== undefined) updates.lat        = lat;
+    if (lng       !== undefined) updates.lng        = lng;
 
     let slugChanged = false;
     let newSlug     = current?.slug;
